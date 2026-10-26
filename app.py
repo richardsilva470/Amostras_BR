@@ -145,10 +145,23 @@ def carregar_csv(uploaded_file):
     return df
 
 
+def _eh_rotulo_generico(v):
+    """Rótulos de cabeçalho do SIDRA que não identificam a coluna (Total, ano)."""
+    if pd.isna(v):
+        return True
+    s = str(v).strip()
+    return s == "" or s.lower() == "total" or bool(re.fullmatch(r"\d{4}(\.0)?", s))
+
+
 def carregar_tabela_ibge(uploaded_file, sheet_name=None):
-    """Lê um export do SIDRA/IBGE (xlsx) detectando automaticamente em qual
-    linha começa o cabeçalho de verdade — esses arquivos sempre trazem
-    algumas linhas de título/metadado antes da tabela propriamente dita."""
+    """Lê um export do SIDRA/IBGE (xlsx) no formato padrão de download:
+    linhas de título, cabeçalho em várias linhas (ex.: faixa de renda / ano /
+    "Total"), dados por município "Nome (UF)" e rodapé "Fonte: IBGE ...".
+
+    - detecta onde começam os dados;
+    - escolhe, para cada coluna, o rótulo que realmente a identifica (a linha de
+      cabeçalho com os nomes das categorias, e não "Total" ou o ano);
+    - remove o rodapé e colunas só de texto (ex.: "Classes de rendimento" = Total)."""
     xl = pd.ExcelFile(uploaded_file)
     if sheet_name is None:
         sheet_name = "Tabela" if "Tabela" in xl.sheet_names else xl.sheet_names[0]
@@ -168,30 +181,56 @@ def carregar_tabela_ibge(uploaded_file, sheet_name=None):
         if len(outros) == 0 or outros.notna().sum() == 0:
             continue
         frac_numerico = sum(_eh_numerico_ou_traco(v) for v in outros) / len(outros)
-        if frac_numerico >= 0.6:
+        if frac_numerico >= 0.5:
             primeira_linha_dado = i
             break
 
     if primeira_linha_dado is None or primeira_linha_dado == 0:
         return xl.parse(sheet_name)
 
-    linha_cabecalho = primeira_linha_dado - 1
-    bloco_cabecalho = raw.iloc[0:linha_cabecalho + 1]
-    colunas = []
-    for j in range(raw.shape[1]):
-        val = bloco_cabecalho.iloc[-1, j]
-        if pd.isna(val):
-            for k in range(linha_cabecalho, -1, -1):
-                v2 = bloco_cabecalho.iloc[k, j]
-                if pd.notna(v2):
-                    val = v2
+    cab = raw.iloc[:primeira_linha_dado, 1:]
+
+    # linha de rótulos = a mais baixa do cabeçalho com 2+ nomes de categoria
+    linha_rotulos = None
+    for k in range(len(cab) - 1, -1, -1):
+        especificos = [v for v in cab.iloc[k] if not _eh_rotulo_generico(v)]
+        if len(set(map(str, especificos))) >= 2:
+            linha_rotulos = k
+            break
+
+    colunas = ["Município"]
+    for j in range(cab.shape[1]):
+        val = cab.iat[linha_rotulos, j] if linha_rotulos is not None else np.nan
+        if pd.isna(val):  # sem rótulo na linha principal: usa o mais baixo disponível
+            for k in range(len(cab) - 1, -1, -1):
+                if pd.notna(cab.iat[k, j]):
+                    val = cab.iat[k, j]
                     break
-        colunas.append(str(val).strip() if pd.notna(val) else f"col_{j}")
-    colunas[0] = "Município"
+        colunas.append(str(val).strip() if pd.notna(val) else f"col_{j + 1}")
+
+    # nomes repetidos ganham sufixo para não sobrescrever colunas
+    vistos = {}
+    for i, c in enumerate(colunas):
+        if c in vistos:
+            vistos[c] += 1
+            colunas[i] = f"{c} ({vistos[c]})"
+        else:
+            vistos[c] = 0
 
     dados = raw.iloc[primeira_linha_dado:].reset_index(drop=True)
     dados.columns = colunas
-    return dados
+
+    # remove rodapé (Fonte, Notas...) e linhas sem município
+    mun = dados["Município"].astype(str).str.strip()
+    dados = dados[dados["Município"].notna() & ~mun.str.lower().str.match(r"^(fonte|nota|legenda|\(?\d+\))")]
+
+    # remove colunas que não são numéricas (ex.: coluna com o texto "Total")
+    manter = ["Município"]
+    for c in dados.columns[1:]:
+        vals = dados[c].dropna()
+        if len(vals) and all(_eh_numerico_ou_traco(v) for v in vals):
+            manter.append(c)
+    return dados[manter].reset_index(drop=True)
 
 
 def carregar_mapa_regioes(uploaded_file):
@@ -213,7 +252,17 @@ def preparar_municipio(df, mapa, dropar_col_regiao_existente=True):
         cols_regiao = [c for c in df.columns if "microrreg" in str(c).lower() or "mesorreg" in str(c).lower()]
         df = df.drop(columns=cols_regiao, errors="ignore")
     df["muni_norm"] = df["Município"].apply(normalizar_municipio)
-    antes = len(df)
+
+    # nomes abreviados num arquivo e completos no outro (ex.: "São Luiz" no mapa/TSE
+    # e "São Luiz do Anauá" no IBGE): casa pelo início do nome, se for único
+    nomes_mapa = set(mapa["muni_norm"].dropna())
+    def _casar(n):
+        if pd.isna(n) or n in nomes_mapa:
+            return n
+        cands = [m for m in nomes_mapa if n.startswith(m + " ") or m.startswith(n + " ")]
+        return cands[0] if len(cands) == 1 else n
+    df["muni_norm"] = df["muni_norm"].apply(_casar)
+
     df = df.merge(mapa[["muni_norm", "Microrregião"]], on="muni_norm", how="left")
     sem_match = df[df["Microrregião"].isna()]["Município"].dropna().unique().tolist()
     return df, sem_match
