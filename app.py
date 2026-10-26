@@ -17,17 +17,8 @@ FUNDAMENTAL = {"ANALFABETO", "LÊ E ESCREVE", "ENSINO FUNDAMENTAL INCOMPLETO", "
 MEDIO = {"ENSINO MÉDIO INCOMPLETO", "ENSINO MÉDIO COMPLETO"}
 SUPERIOR = {"SUPERIOR INCOMPLETO", "SUPERIOR COMPLETO"}
 
-# padrões (regex) usados para reconhecer as colunas de faixas de renda da
-# Tabela 10300 do IBGE/SIDRA, independentemente das letras de nota de rodapé
-# que o IBGE anexa ao final do nome da coluna (ex.: "...salário mínimo e")
-PADROES_RENDA = {
-    "D/E": [r"at[ée]\s*1/4", r"1/4\s*a\s*1/2", r"1/2\s*a\s*1\s*sal", r"1\s*a\s*2\s*sal", r"sem\s*rendimento"],
-    "C": [r"2\s*a\s*3\s*sal", r"3\s*a\s*5\s*sal"],
-    "B": [r"5\s*a\s*10\s*sal", r"10\s*a\s*15\s*sal", r"15\s*a\s*20\s*sal"],
-    "A": [r"mais\s*de\s*20\s*sal"],
-}
-
-# classificação alternativa de renda, em 3 faixas de salário mínimo (SM)
+# padrões (regex) que reconhecem as colunas de renda da Tabela 10300 do IBGE/SIDRA
+# (robustos às letras de nota de rodapé) e as agrupam em 3 faixas de salário mínimo (SM)
 PADROES_RENDA_SM = {
     "ATÉ 2 SM": [r"at[ée]\s*1/4", r"1/4\s*a\s*1/2", r"1/2\s*a\s*1\s*sal", r"1\s*a\s*2\s*sal", r"sem\s*rendimento"],
     "2 A 5 SM": [r"2\s*a\s*3\s*sal", r"3\s*a\s*5\s*sal"],
@@ -105,9 +96,9 @@ def _eh_numerico_ou_traco(v):
         return False
 
 
-def classificar_colunas_renda(colunas, padroes_renda=PADROES_RENDA):
+def classificar_colunas_renda(colunas, padroes_renda=PADROES_RENDA_SM):
     """Agrupa as colunas de faixa de renda da tabela 10300 do IBGE segundo o
-    dicionário de padrões informado (por padrão, Classe A/B/C/D-E), reconhecendo
+    dicionário de padrões informado (faixas de salário mínimo), reconhecendo
     o texto da coluna por regex (robusto a diferentes letras de nota de rodapé
     entre exportações)."""
     grupos = {classe: [] for classe in padroes_renda}
@@ -247,7 +238,7 @@ st.sidebar.header("4. Religião (IBGE)")
 arq_rel = st.sidebar.file_uploader("Tabela 3458 - Religião", type=["xlsx", "xls"], key="rel")
 
 st.sidebar.header("5. Renda / Salário (IBGE)")
-arq_sal = st.sidebar.file_uploader("Tabela 10300 - Classes de rendimento", type=["xlsx", "xls"], key="sal")
+arq_sal = st.sidebar.file_uploader("Tabela 10300 - Faixas de rendimento", type=["xlsx", "xls"], key="sal")
 
 st.sidebar.header("Desenho amostral")
 n_amostra = st.sidebar.number_input("Tamanho da amostra", min_value=1, value=1000, step=1)
@@ -269,7 +260,7 @@ st.title("📊 Desenho Amostral Eleitoral — qualquer estado")
 st.caption(
     "Carregue os 5 arquivos no menu à esquerda. O app cruza as bases pelo município, "
     "calcula a distribuição real da população/eleitorado por microrregião nas variáveis de "
-    "ponderação (idade, gênero, escolaridade, classe social, PEA, cor/raça e religião) e monta "
+    "ponderação (idade, gênero, escolaridade, renda em faixas de SM, PEA, cor/raça e religião) e monta "
     "a tabela final de amostra — do mesmo jeito que foi feito para o Acre."
 )
 
@@ -373,7 +364,7 @@ total_rel = rel[colunas_religiao].sum().sum()
 tab_rel = rel.groupby("Microrregião")[colunas_religiao].sum() / total_rel
 
 # --------------------------------------------------------------------------- #
-# 5. Renda / Classe social
+# 5. Renda (faixas de salário mínimo)
 # --------------------------------------------------------------------------- #
 sal = carregar_tabela_ibge(arq_sal)
 sal, sem_match = preparar_municipio(sal, mapa)
@@ -381,23 +372,7 @@ if sem_match:
     avisos_municipios_sem_match["Renda/Salário"] = sem_match
 sal = sal.dropna(subset=["Microrregião"])
 colunas_renda = [c for c in sal.columns if c not in ("Município", "Total", "muni_norm", "Microrregião")]
-grupos_renda = classificar_colunas_renda(colunas_renda)
-faltando_grupos = [k for k, v in grupos_renda.items() if not v]
-if faltando_grupos:
-    st.warning(
-        f"Não reconheci automaticamente as colunas de renda para: {', '.join(faltando_grupos)}. "
-        "Confira se o arquivo segue o padrão da Tabela 10300 do IBGE."
-    )
-for classe, cols in grupos_renda.items():
-    for c in cols:
-        sal[c] = numerico(sal[c])
-    sal[f"Classe {classe}"] = sal[cols].sum(axis=1) if cols else 0
 
-colunas_classe = [f"Classe {c}" for c in ["A", "B", "C", "D/E"]]
-total_sal = sal[colunas_classe].sum().sum()
-tab_classe = sal.groupby("Microrregião")[colunas_classe].sum() / total_sal
-
-# classificação alternativa: RENDA em 3 faixas de salário mínimo
 grupos_renda_sm = classificar_colunas_renda(colunas_renda, PADROES_RENDA_SM)
 faltando_grupos_sm = [k for k, v in grupos_renda_sm.items() if not v]
 if faltando_grupos_sm:
@@ -427,8 +402,6 @@ for col in ["Homens", "Mulheres"]:
     tabela_bruta[col] = tab_genero[col].reindex(microrregioes) if col in tab_genero.columns else 0
 for col in ["fundamental", "médio", "superior"]:
     tabela_bruta[col] = tab_esc[col].reindex(microrregioes)
-for col in colunas_classe:
-    tabela_bruta[col] = tab_classe[col].reindex(microrregioes)
 for col in colunas_renda_sm:
     tabela_bruta[col] = tab_renda_sm[col].reindex(microrregioes)
 for col in ["PEA", "NPEA"]:
@@ -444,7 +417,6 @@ GRUPOS = {
     "Faixa etária": FAIXAS_IDADE_ORDEM,
     "Gênero": ["Homens", "Mulheres"],
     "Escolaridade": ["fundamental", "médio", "superior"],
-    "Classe social": colunas_classe,
     "Renda (faixas de SM)": colunas_renda_sm,
     "PEA / NPEA": ["PEA", "NPEA"],
     "Cor / Raça": ["Branca", "Preta", "Parda", "Amarelo + outros"],
