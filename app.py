@@ -464,21 +464,75 @@ def ajustar_linhas(bloco, total_linha, tol):
     return ajustado, fora
 
 
-def raking(bloco, total_linha, alvo_coluna, max_iter=2000, tol=1e-12):
-    """Ajuste iterativo proporcional (IPF): força cada linha a somar o Total da
-    linha E cada coluna a somar o alvo informado pelo usuário."""
+CASAS = 2                      # casas decimais em % (0,01 p.p.)
+UNIDADE = 10 ** -(CASAS + 2)   # 0,01 p.p. expresso em proporção (0.0001)
+
+
+def arredondar_maior_resto(serie, total_unidades):
+    """Arredonda uma série (em proporção) para múltiplos de UNIDADE de modo que
+    a soma dê exatamente total_unidades * UNIDADE (método do maior resto)."""
+    u = serie.to_numpy(dtype=float) / UNIDADE
+    base = np.floor(u + 1e-9)
+    falta = int(round(total_unidades - base.sum()))
+    ordem = np.argsort(-(u - base))
+    if falta > 0:
+        base[ordem[:falta]] += 1
+    elif falta < 0:
+        base[ordem[::-1][:abs(falta)]] -= 1
+    return pd.Series(base * UNIDADE, index=serie.index)
+
+
+def raking(bloco, total_linha, alvo_coluna, max_iter=200000, tol=1e-13):
+    """Ajuste iterativo proporcional (IPF): normaliza linhas e colunas
+    alternadamente até que TODA linha some o Total da linha e TODA coluna some
+    o alvo informado (sem reescalar os alvos)."""
     m = bloco.to_numpy(dtype=float).copy()
     r = total_linha.to_numpy(dtype=float)
     c = alvo_coluna.to_numpy(dtype=float)
-    c = c / c.sum() * r.sum() if c.sum() > 0 else c
+    # células zeradas travam o ajuste; uma semente mínima deixa sempre encaixar
+    m = np.where((m <= 0) & (r[:, None] > 0) & (c[None, :] > 0), 1e-9, m)
+    m = np.where((r[:, None] == 0) | (c[None, :] == 0), 0, m)
     for _ in range(max_iter):
         rs = m.sum(axis=1)
         m *= np.divide(r, rs, out=np.zeros_like(r), where=rs > 0)[:, None]
         cs = m.sum(axis=0)
         m *= np.divide(c, cs, out=np.zeros_like(c), where=cs > 0)[None, :]
-        if np.abs(m.sum(axis=1) - r).max() < tol:
+        if np.abs(m.sum(axis=1) - r).max() < tol and np.abs(m.sum(axis=0) - c).max() < tol:
             break
     return pd.DataFrame(m, index=bloco.index, columns=bloco.columns)
+
+
+def arredondamento_controlado(bloco, total_linha, alvo_coluna):
+    """Arredonda cada célula para 0,01 p.p. garantindo que a soma de cada linha
+    seja EXATAMENTE o Total da linha e a de cada coluna EXATAMENTE o alvo
+    digitado. Resolve um problema de transporte (cada célula sobe ou desce 1
+    unidade), preferindo arredondar para cima as células de maior resto."""
+    from scipy.optimize import linprog
+
+    u = bloco.to_numpy(dtype=float) / UNIDADE
+    R = np.rint(total_linha.to_numpy(dtype=float) / UNIDADE).astype(int)
+    C = np.rint(alvo_coluna.to_numpy(dtype=float) / UNIDADE).astype(int)
+    base = np.floor(u + 1e-9)
+    resto = u - base
+    nl, nc = base.shape
+    dr = R - base.sum(axis=1)
+    dc = C - base.sum(axis=0)
+
+    A = np.zeros((nl + nc, nl * nc))
+    for i in range(nl):
+        A[i, i * nc:(i + 1) * nc] = 1
+    for j in range(nc):
+        A[nl + j, j::nc] = 1
+    b = np.concatenate([dr, dc])
+
+    res = linprog(-resto.ravel(), A_eq=A, b_eq=b, bounds=[(0, 1)] * (nl * nc), method="highs")
+    if not res.success:  # caso extremo: permite mover mais de 1 unidade por célula
+        res = linprog(np.zeros(nl * nc), A_eq=A, b_eq=b,
+                      bounds=[(-b_, None) for b_ in base.ravel()], method="highs")
+    if not res.success:
+        return None
+    final = base + np.rint(res.x).reshape(nl, nc)
+    return pd.DataFrame(final * UNIDADE, index=bloco.index, columns=bloco.columns)
 
 
 def _resetar(chaves):
@@ -527,9 +581,22 @@ st.caption(
     "colunas da linha importa) e o app reajusta a linha para bater com o Total."
 )
 
-total_linha = tabela_bruta["Total"]
+# Total de cada linha com 2 casas (em %) somando exatamente 100,00%
+total_linha = arredondar_maior_resto(tabela_bruta["Total"], round(1 / UNIDADE))
 tabela_final = tabela_bruta.copy()
+tabela_final["Total"] = total_linha
 log_ajustes = []
+
+# grupos em que o total de cada coluna é SEMPRE informado pelo usuário
+# (linha e coluna precisam bater ao mesmo tempo)
+GRUPOS_COM_ALVO_FIXO = {"Renda (faixas de SM)"}
+
+st.markdown("#### 🎯 Total desejado das colunas de Renda (faixas de SM)")
+st.caption(
+    "Digite o percentual estadual correto de cada faixa. O app ajusta a tabela para que cada linha "
+    "feche no Total da mesorregião **e** cada coluna feche no valor que você informar."
+)
+area_alvos_sm = st.container()
 
 for nome_grupo, cols in GRUPOS.items():
     cols = [c for c in cols if c in tabela_bruta.columns]
@@ -554,13 +621,73 @@ for nome_grupo, cols in GRUPOS.items():
         linhas_editadas = ~np.isclose(editado.to_numpy(), base_editor.to_numpy()).all(axis=1)
         linhas_editadas = pd.Series(linhas_editadas, index=bloco_orig.index)
 
-        usar_rake = st.checkbox(
-            "Também quero definir o total de cada coluna (o app ajusta linhas e colunas ao mesmo tempo — raking)",
-            key=k_rake,
-        )
+        alvo_fixo = nome_grupo in GRUPOS_COM_ALVO_FIXO
+        chaves_alvo_fixo = [f"{k_alvo}_{i}" for i in range(len(cols))]
+        if alvo_fixo:
+            usar_rake = True
+        else:
+            usar_rake = st.checkbox(
+                "Também quero definir o total de cada coluna (o app ajusta linhas e colunas ao mesmo tempo — raking)",
+                key=k_rake,
+            )
         bloco_ed = editado / 100
 
-        if usar_rake:
+        if alvo_fixo:
+            soma_cols = bloco_orig.sum()
+            alvo_padrao = (
+                arredondar_maior_resto(soma_cols / soma_cols.sum(), round(1 / UNIDADE)) * 100
+                if soma_cols.sum() > 0 else soma_cols * 0
+            )
+            with area_alvos_sm:
+                campos = st.columns(len(cols))
+                valores = []
+                for i, (campo, c) in enumerate(zip(campos, cols)):
+                    valores.append(campo.number_input(
+                        f"{c} (%)", min_value=0.0, max_value=100.0,
+                        value=float(round(alvo_padrao[c], CASAS)), step=0.01, format="%.2f",
+                        key=chaves_alvo_fixo[i],
+                        help=f"Valor calculado do IBGE: {alvo_padrao[c]:.2f}%",
+                    ))
+                # valores exatamente como digitados (em 0,01 p.p.), sem reescalar
+                alvo_coluna = pd.Series(np.round(valores, CASAS) / 100, index=cols, dtype=float)
+                soma_un = int(np.rint(alvo_coluna.sum() / UNIDADE))
+                total_un = int(np.rint(total_linha.sum() / UNIDADE))
+
+            if soma_un != total_un:
+                diff = (total_un - soma_un) / 100
+                with area_alvos_sm:
+                    st.error(
+                        f"Os valores digitados somam **{soma_un / 100:.2f}%**, mas as mesorregiões somam "
+                        f"**{total_un / 100:.2f}%**. Como cada linha tem que fechar no seu Total, as colunas "
+                        f"também precisam somar {total_un / 100:.2f}% — "
+                        + (f"faltam **{diff:.2f} p.p.**" if diff > 0 else f"sobram **{-diff:.2f} p.p.**")
+                        + ". Corrija um dos campos; até lá a renda fica só com o ajuste por linha."
+                    )
+                ajustado, fora = ajustar_linhas(bloco_ed, total_linha, tol_ajuste)
+            else:
+                rakeado = raking(bloco_ed, total_linha, alvo_coluna)
+                exato = arredondamento_controlado(rakeado, total_linha, alvo_coluna)
+                ajustado = exato if exato is not None else rakeado
+                fora = (ajustado - bloco_ed).abs().max(axis=1) > 1e-9
+
+                soma_l = np.rint(ajustado.sum(axis=1) / UNIDADE)
+                soma_c = np.rint(ajustado.sum() / UNIDADE)
+                ok = (
+                    exato is not None
+                    and (soma_l == np.rint(total_linha / UNIDADE)).all()
+                    and (soma_c == np.rint(alvo_coluna / UNIDADE)).all()
+                )
+                with area_alvos_sm:
+                    if ok:
+                        st.success(
+                            "✅ Encaixado: toda linha fecha exatamente no Total da mesorregião e toda coluna "
+                            "fecha exatamente no valor digitado ("
+                            + " · ".join(f"{c}: {ajustado[c].sum() * 100:.2f}%" for c in cols)
+                            + "). Os valores estão arredondados em 2 casas, então a soma que você vê bate."
+                        )
+                    else:
+                        st.error("Não consegui encaixar exatamente. Confira se há mesorregião com Total zerado.")
+        elif usar_rake:
             soma_cols = bloco_orig.sum()
             alvo_padrao = (soma_cols / soma_cols.sum() * 100).round(2) if soma_cols.sum() > 0 else soma_cols
             alvo_df = st.data_editor(
@@ -615,7 +742,7 @@ for nome_grupo, cols in GRUPOS.items():
             "↩️ Restaurar valores originais deste grupo",
             key=f"reset_{slug}",
             on_click=_resetar,
-            args=([k_ed, k_rake, k_alvo],),
+            args=([k_ed, k_rake, k_alvo] + chaves_alvo_fixo,),
         )
 
     tabela_final[cols] = ajustado
