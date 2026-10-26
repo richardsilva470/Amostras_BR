@@ -254,6 +254,16 @@ n_amostra = st.sidebar.number_input("Tamanho da amostra", min_value=1, value=100
 confianca = st.sidebar.number_input("Nível de confiança", min_value=0.0, max_value=1.0, value=0.95, step=0.01)
 margem_erro = np.sqrt(0.25 / n_amostra) * -100 * norm.ppf((1 - confianca) / 2)
 
+st.sidebar.header("Ajuste dos subgrupos")
+ajuste_automatico = st.sidebar.checkbox(
+    "Ajustar automaticamente subgrupos que não batem com o Total da linha", value=True
+)
+tol_pp = st.sidebar.number_input(
+    "Tolerância (pontos percentuais)", min_value=0.0, max_value=5.0, value=0.01, step=0.01, format="%.3f",
+    help="Linhas cuja soma do subgrupo difere do Total por mais que isso são ajustadas.",
+)
+tol_ajuste = tol_pp / 100
+
 
 st.title("📊 Desenho Amostral Eleitoral — qualquer estado")
 st.caption(
@@ -404,36 +414,80 @@ colunas_renda_sm = ["ATÉ 2 SM", "2 A 5 SM", "MAIS DE 5 SM"]
 total_sal_sm = sal[colunas_renda_sm].sum().sum()
 tab_renda_sm = sal.groupby("Microrregião")[colunas_renda_sm].sum() / total_sal_sm
 
+
 # --------------------------------------------------------------------------- #
-# Monta a tabela final (equivalente à aba "Amostra")
+# Monta a tabela "bruta" (exatamente como vem do IBGE/TSE, antes do ajuste)
 # --------------------------------------------------------------------------- #
 
-tabela_final = pd.DataFrame(index=microrregioes)
-tabela_final["Total"] = tab_total.reindex(microrregioes)
+tabela_bruta = pd.DataFrame(index=microrregioes)
+tabela_bruta["Total"] = tab_total.reindex(microrregioes)
 for col in tab_idade.columns:
-    tabela_final[col] = tab_idade[col].reindex(microrregioes)
+    tabela_bruta[col] = tab_idade[col].reindex(microrregioes)
 for col in ["Homens", "Mulheres"]:
-    tabela_final[col] = tab_genero[col].reindex(microrregioes) if col in tab_genero.columns else 0
+    tabela_bruta[col] = tab_genero[col].reindex(microrregioes) if col in tab_genero.columns else 0
 for col in ["fundamental", "médio", "superior"]:
-    tabela_final[col] = tab_esc[col].reindex(microrregioes)
+    tabela_bruta[col] = tab_esc[col].reindex(microrregioes)
 for col in colunas_classe:
-    tabela_final[col] = tab_classe[col].reindex(microrregioes)
+    tabela_bruta[col] = tab_classe[col].reindex(microrregioes)
 for col in colunas_renda_sm:
-    tabela_final[col] = tab_renda_sm[col].reindex(microrregioes)
+    tabela_bruta[col] = tab_renda_sm[col].reindex(microrregioes)
 for col in ["PEA", "NPEA"]:
-    tabela_final[col] = tab_pea[col].reindex(microrregioes)
+    tabela_bruta[col] = tab_pea[col].reindex(microrregioes)
 for col in ["Branca", "Preta", "Parda", "Amarelo + outros"]:
-    tabela_final[col] = tab_cor[col].reindex(microrregioes)
+    tabela_bruta[col] = tab_cor[col].reindex(microrregioes)
 for col in colunas_religiao:
-    tabela_final[col] = tab_rel[col].reindex(microrregioes)
+    tabela_bruta[col] = tab_rel[col].reindex(microrregioes)
+tabela_bruta = tabela_bruta.fillna(0)
 
-tabela_final = tabela_final.fillna(0)
-linha_total = tabela_final.sum(numeric_only=True)
-linha_total.name = "Total Geral"
-tabela_final = pd.concat([tabela_final, linha_total.to_frame().T])
+# grupos de subcolunas que, somadas, devem bater com o "Total" de cada linha
+GRUPOS = {
+    "Faixa etária": FAIXAS_IDADE_ORDEM,
+    "Gênero": ["Homens", "Mulheres"],
+    "Escolaridade": ["fundamental", "médio", "superior"],
+    "Classe social": colunas_classe,
+    "Renda (faixas de SM)": colunas_renda_sm,
+    "PEA / NPEA": ["PEA", "NPEA"],
+    "Cor / Raça": ["Branca", "Preta", "Parda", "Amarelo + outros"],
+    "Religião": colunas_religiao,
+}
+
+
+def ajustar_linhas(bloco, total_linha, tol):
+    """Para cada linha cuja soma do subgrupo difere do Total da linha, aplica
+    valor_ajustado = valor / soma(subgrupo da linha) * Total da linha.
+    Ex.: PEA = 22,31% / (22,31% + 17,33%) * 41,22%."""
+    soma = bloco.sum(axis=1)
+    fora = (soma - total_linha).abs() > tol
+    fator = (total_linha / soma.replace(0, np.nan)).fillna(0)
+    ajustado = bloco.copy()
+    ajustado.loc[fora] = bloco.loc[fora].mul(fator[fora], axis=0)
+    return ajustado, fora
+
+
+def raking(bloco, total_linha, alvo_coluna, max_iter=2000, tol=1e-12):
+    """Ajuste iterativo proporcional (IPF): força cada linha a somar o Total da
+    linha E cada coluna a somar o alvo informado pelo usuário."""
+    m = bloco.to_numpy(dtype=float).copy()
+    r = total_linha.to_numpy(dtype=float)
+    c = alvo_coluna.to_numpy(dtype=float)
+    c = c / c.sum() * r.sum() if c.sum() > 0 else c
+    for _ in range(max_iter):
+        rs = m.sum(axis=1)
+        m *= np.divide(r, rs, out=np.zeros_like(r), where=rs > 0)[:, None]
+        cs = m.sum(axis=0)
+        m *= np.divide(c, cs, out=np.zeros_like(c), where=cs > 0)[None, :]
+        if np.abs(m.sum(axis=1) - r).max() < tol:
+            break
+    return pd.DataFrame(m, index=bloco.index, columns=bloco.columns)
+
+
+def _resetar(chaves):
+    for k in chaves:
+        st.session_state.pop(k, None)
+
 
 # alocação da amostra por microrregião (maior resto, para fechar em n_amostra)
-alvo = (tabela_final.loc[microrregioes, "Total"] * n_amostra)
+alvo = (tabela_bruta.loc[microrregioes, "Total"] * n_amostra)
 alocacao = alvo.round().astype(int)
 diferenca = int(n_amostra) - alocacao.sum()
 if diferenca != 0:
@@ -461,13 +515,137 @@ if avisos_municipios_sem_match:
             "ignorados automaticamente)."
         )
 
+# --------------------------------------------------------------------------- #
+# Ajuste dos subgrupos (automático + valores digitados pelo usuário)
+# --------------------------------------------------------------------------- #
+
+st.subheader("🔧 Ajuste dos subgrupos")
+st.caption(
+    "Quando a soma de um subgrupo (ex.: PEA + NPEA) não bate com o Total da linha, cada valor é "
+    "corrigido por **valor / soma do subgrupo × Total da linha**. Você pode digitar os valores "
+    "corretos em qualquer célula (em %, ou até em números absolutos — só a proporção entre as "
+    "colunas da linha importa) e o app reajusta a linha para bater com o Total."
+)
+
+total_linha = tabela_bruta["Total"]
+tabela_final = tabela_bruta.copy()
+log_ajustes = []
+
+for nome_grupo, cols in GRUPOS.items():
+    cols = [c for c in cols if c in tabela_bruta.columns]
+    if not cols:
+        continue
+    bloco_orig = tabela_bruta[cols]
+    n_fora_orig = int(((bloco_orig.sum(axis=1) - total_linha).abs() > tol_ajuste).sum())
+
+    slug = re.sub(r"\W+", "_", normalizar_municipio(nome_grupo).lower())
+    k_ed, k_rake, k_alvo = f"ed_{slug}", f"rake_{slug}", f"alvo_{slug}"
+    status = f"⚠️ {n_fora_orig} linha(s) não batem com o Total" if n_fora_orig else "✅ todas as linhas batem"
+
+    with st.expander(f"{nome_grupo} — {status}"):
+        base_editor = (bloco_orig * 100).round(4)
+        editado = st.data_editor(
+            base_editor,
+            key=k_ed,
+            use_container_width=True,
+            column_config={c: st.column_config.NumberColumn(c, format="%.2f", min_value=0.0) for c in cols},
+        )
+        editado = editado.reindex(index=bloco_orig.index, columns=cols).astype(float).fillna(0).clip(lower=0)
+        linhas_editadas = ~np.isclose(editado.to_numpy(), base_editor.to_numpy()).all(axis=1)
+        linhas_editadas = pd.Series(linhas_editadas, index=bloco_orig.index)
+
+        usar_rake = st.checkbox(
+            "Também quero definir o total de cada coluna (o app ajusta linhas e colunas ao mesmo tempo — raking)",
+            key=k_rake,
+        )
+        bloco_ed = editado / 100
+
+        if usar_rake:
+            soma_cols = bloco_orig.sum()
+            alvo_padrao = (soma_cols / soma_cols.sum() * 100).round(2) if soma_cols.sum() > 0 else soma_cols
+            alvo_df = st.data_editor(
+                alvo_padrao.to_frame().T.rename(index={0: "Total da coluna (%)"}),
+                key=k_alvo,
+                use_container_width=True,
+                column_config={c: st.column_config.NumberColumn(c, format="%.2f", min_value=0.0) for c in cols},
+            )
+            alvo_coluna = alvo_df.iloc[0].reindex(cols).astype(float).fillna(0)
+            st.caption(
+                f"Soma dos alvos: {alvo_coluna.sum():.2f}% (se não fechar em 100%, os alvos são "
+                "normalizados proporcionalmente)."
+            )
+            if not ajuste_automatico:
+                st.caption("O raking é aplicado mesmo com o ajuste automático desligado, pois você ativou esta opção.")
+            ajustado = raking(bloco_ed, total_linha, alvo_coluna)
+            fora = (ajustado - bloco_ed).abs().max(axis=1) > 1e-9  # linhas que o raking alterou
+        elif ajuste_automatico:
+            ajustado, fora = ajustar_linhas(bloco_ed, total_linha, tol_ajuste)
+        else:
+            ajustado, fora = bloco_ed.copy(), pd.Series(False, index=bloco_ed.index)
+
+        sem_base = (bloco_ed.sum(axis=1) == 0) & (total_linha > 0)
+        if sem_base.any():
+            st.warning(
+                "Estas linhas têm o subgrupo todo zerado e não podem ser ajustadas — digite os valores: "
+                + ", ".join(sem_base[sem_base].index)
+            )
+
+        for regiao in bloco_ed.index:
+            if fora[regiao] or linhas_editadas[regiao]:
+                antes = bloco_ed.loc[regiao].sum()
+                log_ajustes.append({
+                    "Grupo": nome_grupo,
+                    "Mesorregião": regiao,
+                    "Editado manualmente": "sim" if linhas_editadas[regiao] else "não",
+                    "Método": "raking" if usar_rake else ("proporcional" if ajuste_automatico else "sem ajuste"),
+                    "Soma antes (%)": round(antes * 100, 4),
+                    "Total da linha (%)": round(total_linha[regiao] * 100, 4),
+                    "Diferença (p.p.)": round((antes - total_linha[regiao]) * 100, 4),
+                    "Soma depois (%)": round(ajustado.loc[regiao].sum() * 100, 4),
+                })
+
+        previa = ajustado.copy()
+        previa.insert(0, "Total da linha", total_linha)
+        previa["Soma do subgrupo"] = ajustado.sum(axis=1)
+        previa.loc["Total Geral"] = previa.sum()
+        st.markdown("**Resultado após o ajuste:**")
+        st.dataframe(previa.style.format("{:.2%}"), use_container_width=True)
+
+        st.button(
+            "↩️ Restaurar valores originais deste grupo",
+            key=f"reset_{slug}",
+            on_click=_resetar,
+            args=([k_ed, k_rake, k_alvo],),
+        )
+
+    tabela_final[cols] = ajustado
+
+# linha de Total Geral
+def _com_total(df):
+    linha = df.sum(numeric_only=True)
+    linha.name = "Total Geral"
+    return pd.concat([df, linha.to_frame().T])
+
+tabela_bruta = _com_total(tabela_bruta)
+tabela_final = _com_total(tabela_final)
+tab_log = pd.DataFrame(log_ajustes)
+
+if tab_log.empty:
+    st.success("Nenhuma linha precisou de ajuste.")
+else:
+    with st.expander(f"📋 Registro de ajustes ({len(tab_log)} linha(s) alteradas)"):
+        st.dataframe(tab_log, use_container_width=True, hide_index=True)
+
 st.subheader("Distribuição da amostra por microrregião")
 tab_alocacao = alocacao.to_frame(name="Nº de entrevistas")
 tab_alocacao["% da amostra"] = (tabela_final.loc[microrregioes, "Total"] * 100).round(1)
 st.dataframe(tab_alocacao, use_container_width=True)
 
-st.subheader("Tabela consolidada de ponderação (variáveis x microrregião)")
+st.subheader("Tabela consolidada de ponderação (variáveis x microrregião) — ajustada")
 st.dataframe(tabela_final.style.format("{:.2%}"), use_container_width=True)
+
+with st.expander("Ver tabela original (sem ajuste, como veio do IBGE/TSE)"):
+    st.dataframe(tabela_bruta.style.format("{:.2%}"), use_container_width=True)
 
 # --------------------------------------------------------------------------- #
 # Download em Excel
@@ -477,6 +655,9 @@ buffer = io.BytesIO()
 with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
     mapa.drop(columns=["muni_norm"]).to_excel(writer, sheet_name="Mesorregiões", index=False)
     tabela_final.to_excel(writer, sheet_name="Amostra")
+    tabela_bruta.to_excel(writer, sheet_name="Amostra (original)")
+    if not tab_log.empty:
+        tab_log.to_excel(writer, sheet_name="Ajustes", index=False)
     tab_alocacao.to_excel(writer, sheet_name="Alocação da amostra")
     tse.drop(columns=["muni_norm", "faixa_bucket", "genero_bucket", "esc_bucket"], errors="ignore").to_excel(
         writer, sheet_name="Dados TSE", index=False
