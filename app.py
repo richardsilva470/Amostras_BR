@@ -272,22 +272,99 @@ def preparar_municipio(df, mapa, dropar_col_regiao_existente=True):
 # Sidebar — upload dos 5 arquivos padrão (mesmo formato para qualquer estado)
 # =========================================================================== #
 
+NOMES_ARQUIVOS = {
+    "mapa": "Mapa Município → Mesorregião",
+    "tse": "Eleitorado (TSE)",
+    "pea": "PEA / NPEA (IBGE 10300)",
+    "rel": "Religião (IBGE 3458)",
+    "sal": "Renda / Salário (IBGE 10300)",
+}
+
+
+def identificar_arquivo(f):
+    """Descobre qual dos 5 arquivos é, olhando o CONTEÚDO (não o nome)."""
+    nome = f.name.lower()
+    try:
+        if nome.endswith(".csv"):
+            f.seek(0)
+            inicio = f.read(4096)
+            f.seek(0)
+            for enc in ("utf-8-sig", "cp1252", "latin-1"):
+                try:
+                    txt = inicio.decode(enc).lower()
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if "quantidade de eleitores" in txt or "eleitores" in txt:
+                return "tse"
+            return "mapa"
+        f.seek(0)
+        xl = pd.ExcelFile(f)
+        aba = "Tabela" if "Tabela" in xl.sheet_names else xl.sheet_names[0]
+        raw = xl.parse(aba, header=None, nrows=12)
+        f.seek(0)
+        txt = " ".join(str(v) for v in raw.to_numpy().ravel() if pd.notna(v)).lower()
+        if "tabela 3458" in txt or "religi" in txt:
+            return "rel"
+        # PEA e Salário são ambos a Tabela 10300 (mesmo título); a diferença
+        # está nas colunas: faixas de salário mínimo x "Fora da força de trabalho"
+        # (olha só os rótulos curtos de coluna — o título longo cita "salário mínimo" nos dois)
+        rotulos = " ".join(
+            str(v) for v in raw.to_numpy().ravel() if pd.notna(v) and len(str(v)) < 60
+        ).lower()
+        if re.search(r"at[ée] 1/4|sal[áa]rios? m[íi]nimos?|sem rendimento", rotulos):
+            return "sal"
+        if "fora da força de trabalho" in txt or "fora da forca de trabalho" in txt:
+            return "pea"
+        if "quantidade de eleitores" in txt:
+            return "tse"
+        if raw.shape[1] <= 3:
+            return "mapa"
+    except Exception:
+        f.seek(0)
+    return None
+
+
 st.sidebar.title("Menu")
-st.sidebar.header("1. Mapa de Microrregiões")
-st.sidebar.caption("2 colunas: Município e Microrregião/Mesorregião do estado.")
-arq_mapa = st.sidebar.file_uploader("Município → Microrregião", type=["csv", "xlsx", "xls"], key="mapa")
+st.sidebar.header("📂 Arquivos")
+todos = st.sidebar.file_uploader(
+    "Arraste os 5 arquivos de uma vez",
+    type=["csv", "xlsx", "xls"],
+    accept_multiple_files=True,
+    key="todos",
+    help="Mapa de mesorregiões, eleitorado do TSE (CSV), PEA, Religião e Salário do IBGE. "
+         "O app reconhece cada um pelo conteúdo — o nome do arquivo não importa.",
+)
 
-st.sidebar.header("2. Eleitorado (TSE)")
-arq_tse = st.sidebar.file_uploader("Base de eleitores (CSV)", type=["csv"], key="tse")
+arquivos = {k: None for k in NOMES_ARQUIVOS}
+nao_reconhecidos = []
+for f in todos or []:
+    tipo = identificar_arquivo(f)
+    if tipo is None:
+        nao_reconhecidos.append(f.name)
+    elif arquivos[tipo] is None:
+        arquivos[tipo] = f
+    else:
+        nao_reconhecidos.append(f"{f.name} (parece outro {NOMES_ARQUIVOS[tipo]})")
 
-st.sidebar.header("3. PEA / NPEA (IBGE)")
-arq_pea = st.sidebar.file_uploader("Tabela 10300 - Força de trabalho", type=["xlsx", "xls"], key="pea")
+with st.sidebar.expander("Ou envie / troque um por um"):
+    st.caption("Um arquivo enviado aqui substitui o identificado automaticamente.")
+    tipos_upload = {"mapa": ["csv", "xlsx", "xls"], "tse": ["csv"], "pea": ["xlsx", "xls"],
+                    "rel": ["xlsx", "xls"], "sal": ["xlsx", "xls"]}
+    for k, rotulo in NOMES_ARQUIVOS.items():
+        individual = st.file_uploader(rotulo, type=tipos_upload[k], key=k)
+        if individual is not None:
+            arquivos[k] = individual
 
-st.sidebar.header("4. Religião (IBGE)")
-arq_rel = st.sidebar.file_uploader("Tabela 3458 - Religião", type=["xlsx", "xls"], key="rel")
+for k, rotulo in NOMES_ARQUIVOS.items():
+    if arquivos[k] is not None:
+        st.sidebar.markdown(f"✅ **{rotulo}**  \n<small>{arquivos[k].name}</small>", unsafe_allow_html=True)
+    else:
+        st.sidebar.markdown(f"⬜ {rotulo}")
+if nao_reconhecidos:
+    st.sidebar.warning("Não reconheci: " + "; ".join(nao_reconhecidos) + ". Envie pelo campo individual.")
 
-st.sidebar.header("5. Renda / Salário (IBGE)")
-arq_sal = st.sidebar.file_uploader("Tabela 10300 - Faixas de rendimento", type=["xlsx", "xls"], key="sal")
+arq_mapa, arq_tse, arq_pea, arq_rel, arq_sal = (arquivos[k] for k in ["mapa", "tse", "pea", "rel", "sal"])
 
 st.sidebar.header("Desenho amostral")
 n_amostra = st.sidebar.number_input("Tamanho da amostra", min_value=1, value=1000, step=1)
@@ -307,7 +384,7 @@ tol_ajuste = tol_pp / 100
 
 st.title("📊 Desenho Amostral Eleitoral — qualquer estado")
 st.caption(
-    "Carregue os 5 arquivos no menu à esquerda. O app cruza as bases pelo município, "
+    "Arraste os 5 arquivos de uma vez no menu à esquerda. O app cruza as bases pelo município, "
     "calcula a distribuição real da população/eleitorado por microrregião nas variáveis de "
     "ponderação (idade, gênero, escolaridade, renda em faixas de SM, PEA, cor/raça e religião) e monta "
     "a tabela final de amostra — do mesmo jeito que foi feito para o Acre."
@@ -316,7 +393,8 @@ st.caption(
 arquivos_ok = all([arq_mapa, arq_tse, arq_pea, arq_rel, arq_sal])
 
 if not arquivos_ok:
-    st.info("Carregue os 5 arquivos no menu lateral para gerar a análise.")
+    faltam = [NOMES_ARQUIVOS[k] for k, v in arquivos.items() if v is None]
+    st.info("Arraste os 5 arquivos no menu lateral para gerar a análise. Faltando: " + ", ".join(faltam) + ".")
     st.stop()
 
 avisos_municipios_sem_match = {}
